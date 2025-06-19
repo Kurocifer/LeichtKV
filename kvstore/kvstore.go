@@ -11,6 +11,8 @@ import (
 	"syscall"
 )
 
+const DB_SIG = "BANKAI"
+
 // create the initial mmap that covers the while file.
 func mmapInt(fp *os.File) (int, []byte, error) {
 	fi, err := fp.Stat()
@@ -55,6 +57,9 @@ type KV struct {
 	page struct {
 		flushed uint64   // database size in number of pages
 		temp    [][]byte // newly allocated pages
+		nfree   int
+		nappend int
+		updates map[uint64][]byte
 	}
 }
 
@@ -80,6 +85,15 @@ func extendMmap(db *KV, npages int) error {
 
 // callback for BTree, dereference a pointer. Accessing a page from the mapped address
 func (db *KV) pageGet(ptr uint64) btree.BNode {
+	if page, ok := db.page.updates[ptr]; ok {
+		utils.Assert(page != nil)
+		return btree.BNode{page}
+	}
+
+	return pageGetMapped(db, ptr)
+}
+
+func pageGetMapped(db *KV, ptr uint64) btree.BNode {
 	start := uint64(0)
 
 	for _, chunk := range db.mmap.chunks {
@@ -94,8 +108,9 @@ func (db *KV) pageGet(ptr uint64) btree.BNode {
 	panic("bad ptr")
 }
 
-const DB_SIG = "BANKAI"
-
+func (db *KV) pageDel(ptr uint64) {
+	db.page.updates[ptr] = nil
+}
 func masterLoad(db *KV) error {
 	if db.mmap.file == 0 {
 		// empty file, the master page will be created on the first write
@@ -124,6 +139,21 @@ func masterLoad(db *KV) error {
 	return nil
 }
 
+// callback for FreeList, allocate a new page
+func (db *KV) pageAppend(node btree.BNode) uint64 {
+	utils.Assert(len(node.Data) <= btree.BTREE_PAGE_SIZE)
+	ptr := db.page.flushed + uint64(db.page.nappend)
+	db.page.nappend++
+	db.page.updates[ptr] = node.Data
+
+	return ptr
+}
+
+// callback for FreeList, reuse a page
+func (db *KV) pageUse(ptr uint64, node btree.BNode) {
+	db.page.updates[ptr] = node.Data
+}
+
 // update the master page. Must be atomic
 func masterStore(db *KV) error {
 	var data [32]byte
@@ -146,11 +176,6 @@ func (db *KV) pageNew(node btree.BNode) uint64 {
 	ptr := db.page.flushed + uint64(len(db.page.temp))
 	db.page.temp = append(db.page.temp, node.Data)
 	return ptr
-}
-
-// callback for BTree, deallocate a page
-func (db *KV) pageDel(uint64) {
-
 }
 
 // extend the file to at least npages
@@ -252,15 +277,20 @@ func flushPages(db *KV) error {
 }
 
 func writePages(db *KV) error {
-	npages := int(db.page.flushed) + len(db.page.temp)
-	if err := extendFile(db, npages); err != nil {
-		return err
+	// Update the free list
+	freed := []uint64{}
+
+	for ptr, page := range db.page.updates {
+		if page == nil {
+			freed = append(freed, ptr)
+		}
 	}
 
-	// copy data to the file
-	for i, page := range db.page.temp {
-		ptr := db.page.flushed + uint64(i)
-		copy(db.pageGet(ptr).Data, page)
+	// copy pages to the file
+	for ptr, page := range db.page.updates {
+		if page != nil {
+			copy(pageGetMapped(db, ptr).Data, page)
+		}
 	}
 
 	return nil
